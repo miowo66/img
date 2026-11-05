@@ -336,6 +336,25 @@
     white-space:nowrap;
   }
   .card .fsize{font-size:11.5px;color:var(--muted);font-weight:400;}
+  .card .ftime{
+    font-size:11px;
+    color:var(--muted);
+    display:flex;
+    align-items:center;
+    gap:5px;
+    margin-top:-3px;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+  }
+  .card .ftime .badge{
+    background:#f1eeff;
+    color:var(--purple-2);
+    border-radius:999px;
+    padding:0 7px;
+    font-size:10.5px;
+    font-weight:600;
+  }
   .card .link{
     width:100%;
     padding:7px 10px;
@@ -498,6 +517,7 @@
     <ol>
       <li>第一次使用：点右上角 <b>🔑 Token 设置</b>，粘贴你的 GitHub classic token（勾 <code>repo</code>），点「保存 Token」。保存时会自动向 GitHub 校验一次，通过后下次打开不用重填。</li>
       <li>上传：点上传区选文件，或直接把图片 / 音频拖进去，支持一次多选。上传进度和成功 / 失败状态会显示在上传队列里。</li>
+      <li>图库按<b>上传时间倒序</b>排列，最新传的在最前面，卡片上会显示相对时间（如「3 分钟前」）。这个时间是从提交历史倒推出来的——GitHub 的文件接口本身不返回时间戳，所以第一次加载会多花一两秒，之后缓存在本地。</li>
       <li>图库：每张卡片可以 <b>复制</b> 外链（<code>https://用户名.github.io/仓库名/文件名</code> 格式）、<b>打开</b> 原文件、<b>删除</b>（调用 GitHub API DELETE，用文件 sha 定位）。</li>
       <li>换用户名 / 仓库：打开本文件，改最上面 <code>CONFIG</code> 里的 <code>owner</code>、<code>repo</code>、<code>branch</code> 即可，全站只认这一处配置。</li>
       <li>想把页面本身也放到网上：把这个文件改名为 <code>index.html</code> 提交到仓库根目录，之后访问 <code>https://用户名.github.io/仓库名/</code> 就能直接用（手机也能开）。</li>
@@ -664,8 +684,130 @@ async function verifyToken() {
   }
 }
 
+/* ------------------------- 上传时间（排序用） -------------------------
+   GitHub 的 contents 接口不返回文件时间，只能靠提交历史倒推：
+   本页上传时提交信息固定写 `upload: 文件名`，于是从提交列表就能反查出每个文件的时间。
+   结果按 sha 缓存在 localStorage，文件没变就不会重复请求。            */
+const TS_KEY = 'gh_pages_imgbed_ts_v1';
+let tsCache = (() => {
+  try { return JSON.parse(localStorage.getItem(TS_KEY) || '{}') || {}; }
+  catch (e) { return {}; }
+})();
+let tsSaveTimer = null;
+function saveTsCache() {
+  clearTimeout(tsSaveTimer);
+  tsSaveTimer = setTimeout(() => {
+    try { localStorage.setItem(TS_KEY, JSON.stringify(tsCache)); } catch (e) {}
+  }, 400);
+}
+
+function nameFromCommitMessage(msg) {
+  const first = String(msg || '').trim().split('\n')[0];
+  const m = /^(?:upload|delete|add|update|create|remove)\s*:\s*(.+)$/i.exec(first);
+  return m ? m[1].trim() : null;
+}
+
+/** 翻提交历史，一次请求覆盖 100 个提交；命中全部文件就提前停止 */
+async function mapTimesFromCommits(wanted, maxPages) {
+  const map = new Map();
+  const hit = new Set();
+  for (let page = 1; page <= maxPages; page++) {
+    let arr;
+    try {
+      arr = await ghGet(`/repos/${CONFIG.owner}/${CONFIG.repo}/commits?sha=${encodeURIComponent(CONFIG.branch)}&per_page=100&page=${page}`);
+    } catch (e) { break; }
+    if (!Array.isArray(arr) || !arr.length) break;
+
+    for (const c of arr) {
+      const t = Date.parse((c.commit && c.commit.committer && c.commit.committer.date) || '') || 0;
+      if (!t) continue;
+      const nm = nameFromCommitMessage(c.commit && c.commit.message);
+      if (!nm || hit.has(nm) || !wanted.has(nm)) continue;   // 最新的提交最先出现，首次命中即最终时间
+      hit.add(nm);
+      map.set(nm, t);
+    }
+    if (hit.size >= wanted.size) break;   // 全部找到了
+    if (arr.length < 100) break;          // 没有更多历史了
+  }
+  return map;
+}
+
+/** 兜底：逐个文件查它最后一次提交（比如用网页 UI 上传的，提交信息对不上） */
+async function mapTimesPerFile(names, concurrency) {
+  const map = new Map();
+  const queue = names.slice();
+  async function worker() {
+    while (queue.length) {
+      const n = queue.shift();
+      try {
+        const arr = await ghGet(`/repos/${CONFIG.owner}/${CONFIG.repo}/commits?path=${encodeURIComponent(n)}&sha=${encodeURIComponent(CONFIG.branch)}&per_page=1`);
+        if (Array.isArray(arr) && arr.length) {
+          const t = Date.parse((arr[0].commit && arr[0].commit.committer && arr[0].commit.committer.date) || '') || 0;
+          if (t) map.set(n, t);
+        }
+      } catch (e) { /* 单个失败不影响整体 */ }
+    }
+  }
+  const n = Math.min(concurrency || 4, queue.length);
+  await Promise.all(Array.from({ length: n }, worker));
+  return map;
+}
+
+/** 给文件列表补上 t（上传时间） */
+async function attachTimes(files) {
+  if (!files.length) return files;
+  const got = new Map();
+
+  // 1) 缓存命中（sha 未变才可信，文件被覆盖后 sha 会变）
+  files.forEach((f) => {
+    const c = tsCache[f.name];
+    if (c && c.sha === f.sha && c.t) got.set(f.name, c.t);
+  });
+
+  // 2) 从提交历史挖
+  let rest = files.filter((f) => !got.has(f.name)).map((f) => f.name);
+  if (rest.length) {
+    const m = await mapTimesFromCommits(new Set(rest), 5);
+    m.forEach((t, n) => got.set(n, t));
+    rest = rest.filter((n) => !got.has(n));
+  }
+
+  // 3) 剩下的逐个补查
+  if (rest.length) {
+    const m = await mapTimesPerFile(rest, 4);
+    m.forEach((t, n) => got.set(n, t));
+  }
+
+  files.forEach((f) => {
+    f.t = got.get(f.name) || 0;
+    if (f.t) tsCache[f.name] = { sha: f.sha, t: f.t };
+  });
+  saveTsCache();
+  return files;
+}
+
+/** 按上传时间倒序（最新在前）；没拿到时间的沉到后面，再按名称排 */
+function sortByTimeDesc(files) {
+  return files.sort((a, b) => (b.t || 0) - (a.t || 0) || a.name.localeCompare(b.name, 'zh'));
+}
+
+function relTime(t) {
+  if (!t) return '';
+  const d = Date.now() - t;
+  if (d < 60e3) return '刚刚';
+  const m = Math.floor(d / 60e3);
+  if (m < 60) return m + ' 分钟前';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + ' 小时前';
+  const day = Math.floor(h / 24);
+  if (day < 30) return day + ' 天前';
+  const dt = new Date(t);
+  const p = (v) => String(v).padStart(2, '0');
+  return `${dt.getFullYear()}-${p(dt.getMonth() + 1)}-${p(dt.getDate())}`;
+}
+
 /* ------------------------- 文件列表 ------------------------- */
-let remoteFiles = [];          // [{name, sha, size, download_url}]
+let remoteFiles = [];          // [{name, sha, size, t}]
 const nameSet = new Set();     // 已存在的文件名，用于重名判断
 
 async function listFiles(silent) {
@@ -675,12 +817,17 @@ async function listFiles(silent) {
     remoteFiles = (Array.isArray(arr) ? arr : [])
       .filter((f) => f.type === 'file')
       .filter((f) => !HIDE_NAMES.includes(f.name.toLowerCase()))
-      .filter((f) => !f.name.startsWith('.'))
-      .sort((a, b) => a.name.localeCompare(b.name, 'zh'));
+      .filter((f) => !f.name.startsWith('.'));
     nameSet.clear();
     remoteFiles.forEach((f) => nameSet.add(f.name));
-    renderGallery(remoteFiles);
-    if (!silent) toast(`已读取 ${remoteFiles.length} 个文件`, 'ok', 2000);
+
+    // 先出图（此时还没有时间，按名称垫一下），补到时间后再按时间重排
+    renderGallery(remoteFiles.slice().sort((a, b) => a.name.localeCompare(b.name, 'zh')));
+
+    await attachTimes(remoteFiles);
+    renderGallery(sortByTimeDesc(remoteFiles));
+
+    if (!silent) toast(`已读取 ${remoteFiles.length} 个文件（按上传时间倒序）`, 'ok', 2000);
   } catch (e) {
     toast('读取图库失败：' + e.message, 'err', 5000);
     renderGallery([]);
@@ -786,6 +933,25 @@ function buildCard(file) {
     fname.appendChild(sz);
   }
 
+  // 上传时间：让「最新在前」的排序看得见
+  if (file.t) {
+    const ft = document.createElement('div');
+    ft.className = 'ftime';
+    const rel = document.createElement('span');
+    rel.className = 'badge';
+    rel.textContent = relTime(file.t);
+    const abs = document.createElement('span');
+    const dt = new Date(file.t);
+    const p = (v) => String(v).padStart(2, '0');
+    abs.textContent = `🕒 ${dt.getFullYear()}-${p(dt.getMonth() + 1)}-${p(dt.getDate())} ${p(dt.getHours())}:${p(dt.getMinutes())}`;
+    ft.append(rel, abs);
+    ft.title = '上传时间：' + dt.toLocaleString('zh-CN', { hour12: false });
+    meta.appendChild(fname);
+    meta.appendChild(ft);
+  } else {
+    meta.appendChild(fname);
+  }
+
   const link = document.createElement('input');
   link.className = 'link';
   link.readOnly = true;
@@ -812,7 +978,7 @@ function buildCard(file) {
   bDel.onclick = () => deleteFile(name, file.sha, card, bDel);
 
   btns.append(bCopy, bOpen, bDel);
-  meta.append(fname, link, btns);
+  meta.append(link, btns);   // fname / ftime 已在上面按顺序追加
   card.append(thumb, meta);
   return card;
 }
@@ -965,10 +1131,14 @@ async function uploadOne(file, ui) {
       name,
       sha: res && res.content ? res.content.sha : '',
       size: file.size,
+      t: Date.now(),            // 刚传完，时间就是现在
       _localUrl: localUrl,
     };
-    remoteFiles.push(entry);
-    remoteFiles.sort((a, b) => a.name.localeCompare(b.name, 'zh'));
+    tsCache[name] = { sha: entry.sha, t: entry.t };
+    saveTsCache();
+
+    remoteFiles.unshift(entry);          // 最新的放到最前面
+    sortByTimeDesc(remoteFiles);
     renderGallery(remoteFiles);
     $('countTag').textContent = remoteFiles.length + ' 个';
     return entry;
